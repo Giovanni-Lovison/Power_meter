@@ -9,11 +9,12 @@
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
-#define UPDATE_INTERVAL 200
-#define DISPLAY_INTERVAL 200
-#define MAX_ERRORS 10
-#define WATCHDOG_TIMEOUT 1800000
-#define SERIAL_CLEAR_INTERVAL 5000
+#define UPDATE_INTERVAL 500    
+#define DISPLAY_INTERVAL 100    
+#define MAX_ERRORS 5           
+#define WATCHDOG_TIMEOUT 900000 
+#define SERIAL_CLEAR_INTERVAL 2000
+#define DISPLAY_RESET_INTERVAL 300000
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SoftwareSerial pzemSerial(2, 3);
@@ -25,6 +26,8 @@ unsigned long lastUpdate = 0;
 unsigned long lastDisplay = 0;
 unsigned long lastValidReading = 0;
 unsigned long lastSerialClear = 0;
+unsigned long lastResetTime = 0;
+unsigned long lastDisplayReset = 0;
 int consecutiveErrors = 0;
 bool isConnected = false;
 bool displayNeedsUpdate = true;
@@ -37,11 +40,11 @@ void setup() {
     Wire.setClock(100000);
     
     if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println(F("Errore display SSD1306"));
+        Serial.println(F("SSD1306 Display Error"));
         while(1);
     }
     
-    Serial.println(F("Display OLED inizializzato"));
+    Serial.println(F("OLED Display Initialized"));
     
     showStartupScreen();
     
@@ -49,13 +52,23 @@ void setup() {
     lastDisplay = millis();
     lastValidReading = millis();
     lastSerialClear = millis();
+    lastResetTime = millis();
+    lastDisplayReset = millis();
     
-    Serial.println(F("Sistema pronto - Lettura ogni 200ms"));
+    Serial.print(F("Start timestamp: "));
+    Serial.println(lastValidReading);
+    
+    Serial.println(F("System ready - Reading every 1000ms"));
     delay(2000);
 }
 
 void loop() {
     unsigned long currentTime = millis();
+    
+    if (currentTime - lastDisplayReset >= DISPLAY_RESET_INTERVAL) {
+        Serial.println(F("Performing display reset..."));
+        resetDisplay();
+    }
     
     if (currentTime - lastSerialClear >= SERIAL_CLEAR_INTERVAL) {
         clearSerialBuffers();
@@ -65,16 +78,16 @@ void loop() {
     if (currentTime - lastUpdate >= UPDATE_INTERVAL) {
         readPowerData();
         lastUpdate = currentTime;
+        displayNeedsUpdate = true;
     }
     
-    if (currentTime - lastDisplay >= DISPLAY_INTERVAL && displayNeedsUpdate) {
+    if (currentTime - lastDisplay >= DISPLAY_INTERVAL) {
         updateDisplay();
         lastDisplay = currentTime;
-        displayNeedsUpdate = false;
     }
     
     checkWatchdog(currentTime);
-    delay(10);
+    delay(5);
 }
 
 void readPowerData() {
@@ -83,23 +96,29 @@ void readPowerData() {
     if (!isnan(power) && power >= 0 && power <= 25000) {
         currentPower = power;
         lastValidPower = power;
-        lastValidReading = millis();
+        if (millis() - lastValidReading > 10000) {
+            lastValidReading = millis();
+        }
         
         if (consecutiveErrors > 0) {
-            Serial.println(F("✓ Connessione ripristinata"));
+            Serial.println(F("✓ Connection restored"));
             consecutiveErrors = 0;
         }
         
         isConnected = true;
         displayNeedsUpdate = true;
         
-        static int logCounter = 0;
-        if (++logCounter >= 10) {
-            Serial.print(F("Potenza: "));
-            Serial.print(currentPower, 1);
-            Serial.println(F("W"));
-            logCounter = 0;
-        }
+
+        unsigned long pzemResetIn = (WATCHDOG_TIMEOUT - (millis() - lastResetTime)) / 1000;
+        unsigned long displayResetIn = (DISPLAY_RESET_INTERVAL - (millis() - lastDisplayReset)) / 1000;
+        
+        Serial.print(F("Power: "));
+        Serial.print(currentPower, 1);
+        Serial.print(F("W | PZEM reset in: "));
+        Serial.print(pzemResetIn);
+        Serial.print(F("s | Display reset in: "));
+        Serial.print(displayResetIn);
+        Serial.println(F("s"));
         
     } else {
         handleReadingError();
@@ -111,46 +130,60 @@ void handleReadingError() {
     isConnected = false;
     displayNeedsUpdate = true;
     
-    Serial.print(F("✗ Errore lettura #"));
+    Serial.print(F("✗ Reading error #"));
     Serial.println(consecutiveErrors);
     
     if (consecutiveErrors >= MAX_ERRORS) {
-        Serial.println(F(">>> TROPPI ERRORI - RESET COMUNICAZIONE <<<"));
+        Serial.println(F(">>> TOO MANY ERRORS - RESETTING COMMUNICATION <<<"));
         resetCommunication();
         consecutiveErrors = 0;
     }
 }
 
 void resetCommunication() {
+    Serial.print(F("Serial reset in progress - Time: "));
+    Serial.print(millis() / 1000);
+    Serial.println(F("s"));
+    
     clearSerialBuffers();
     
-    delay(1000);
-    
     pzemSerial.end();
-    delay(100);
-    pzemSerial.begin(9600);
-    delay(500);
+    delay(200);
     
-    Serial.println(F("Comunicazione reinizializzata"));
+    while(pzemSerial.available()) {
+        pzemSerial.read();
+    }
+    
+    pzemSerial.begin(9600);
+    delay(300);
+    
+    Serial.println(F("Serial reset completed"));
 }
 
 void clearSerialBuffers() {
     while(pzemSerial.available()) {
         pzemSerial.read();
+        delay(1);
     }
     
     while(Serial.available()) {
         Serial.read();
+        delay(1);
     }
 }
 
 void checkWatchdog(unsigned long currentTime) {
-    if (currentTime - lastValidReading > WATCHDOG_TIMEOUT) {
-        Serial.println(F(">>> RESET AUTOMATICO 30 MINUTI <<<"));
+    if (currentTime > WATCHDOG_TIMEOUT && 
+        (currentTime - lastValidReading) > WATCHDOG_TIMEOUT) {
+        
+        unsigned long elapsedMinutes = (currentTime - lastResetTime) / 60000;
+        Serial.print(F(">>> SCHEDULED SERIAL RESET - Time elapsed: "));
+        Serial.print(elapsedMinutes);
+        Serial.println(F(" minutes <<<"));
         
         resetCommunication();
-        
         lastValidReading = currentTime;
+        lastResetTime = currentTime;
         consecutiveErrors = 0;
     }
 }
@@ -215,4 +248,24 @@ void showStartupScreen() {
     display.println("READY");
     
     display.display();
+}
+
+void resetDisplay() {
+    Serial.println(F("Performing display reset..."));
+    
+    display.ssd1306_command(0xAE);
+    delay(100);
+    
+    if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println(F("Display reset failed"));
+        return;
+    }
+    
+    display.clearDisplay();
+    display.display();
+    
+    Serial.println(F("Display reset completed"));
+    lastDisplayReset = millis();
+    
+    displayNeedsUpdate = true;
 }
